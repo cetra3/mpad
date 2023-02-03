@@ -3,13 +3,14 @@ use gtk4 as gtk;
 use eyre::Result;
 use gio::prelude::*;
 use gtk::prelude::*;
-use multicast::setup_channels;
+use multicast::setup;
 use tracing::*;
 use tracing_subscriber::EnvFilter;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
+
+use crate::multicast::TextChange;
 
 mod multicast;
 
@@ -35,46 +36,47 @@ fn build_ui(application: &gtk::Application) {
     // Attach receiver to the main context and set the text buffer text from here
     let text_buffer = text_view.buffer();
 
-    let is_changing = Arc::new(AtomicBool::new(false));
-    let changing = is_changing.clone();
+    let in_change = Arc::new(AtomicBool::new(false));
+    let insert_in_change = in_change.clone();
+    let delete_in_change = in_change.clone();
 
     let (tx, rx) = glib::MainContext::channel(glib::PRIORITY_DEFAULT);
 
-    let (send, recv) = setup_channels().unwrap();
+    let send = setup(tx);
 
-    thread::spawn(move || loop {
-        let val = match recv.recv() {
-            Ok(val) => val,
-            Err(err) => {
-                error!("Could not receive value:{}", err);
-                break;
-            }
-        };
+    let send_remove = send.clone();
 
-        if let Err(err) = tx.send(val) {
-            error!("Could not send data to channel:{}", err);
-            break;
+    text_buffer.connect_insert_text(move |_val, left, text| {
+        if !insert_in_change.load(Ordering::Relaxed) {
+            debug!("Text inserted offset:{}, len:{}", left.offset(), text.len());
+
+            send.try_send(TextChange::Insert {
+                offset: left.offset() as usize,
+                text: text.to_owned(),
+            })
+            .unwrap();
         }
     });
 
-    text_buffer.connect_changed(move |val| {
-        if !changing.load(Ordering::Relaxed) {
-            let (left, right) = val.bounds();
+    text_buffer.connect_delete_range(move |_val, left, right| {
+        if !delete_in_change.load(Ordering::Relaxed) {
+            debug!("Range deleted:{}-{}", left.offset(), right.offset());
 
-            let text = val.text(&left, &right, false).to_string();
-
-            debug!("Buffer: {}, Len:{}", text, text.len());
-
-            send.send(text).unwrap();
+            send_remove
+                .try_send(TextChange::Remove {
+                    offset: left.offset() as usize,
+                    len: (right.offset() - left.offset()) as usize,
+                })
+                .unwrap();
         }
     });
 
     rx.attach(None, move |text| {
-        is_changing.store(true, Ordering::Relaxed);
+        in_change.store(true, Ordering::Relaxed);
 
         text_buffer.set_text(&text);
 
-        is_changing.store(false, Ordering::Relaxed);
+        in_change.store(false, Ordering::Relaxed);
 
         glib::Continue(true)
     });
