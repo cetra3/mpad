@@ -1,7 +1,8 @@
 use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjType, ReadDoc, ROOT};
-use rand::Rng;
 
+use eyre::eyre;
+use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::runtime::Builder;
@@ -11,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::convert::TryInto;
 
 use eyre::Result;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tracing::*;
 
@@ -35,21 +36,30 @@ const BUF_SIZE: usize = 1400;
 pub enum TextChange {
     Insert { offset: usize, text: String },
     Remove { offset: usize, len: usize },
+    SendState,
+    RequestState { site_id: u32 },
 }
 
-pub fn setup(tx: GlibSender<String>) -> TokioSender<TextChange> {
+#[derive(Serialize, Deserialize, Debug)]
+pub enum McastMessage {
+    DeltaChange(Vec<u8>),
+    State(Vec<u8>),
+    RequestState(u32),
+}
+
+pub fn setup(tx: GlibSender<String>, site_id: u32) -> TokioSender<TextChange> {
     let (tokio_tx, tokio_rx) = tokio_channel(128);
 
-    thread::spawn(|| {
+    let tokio_tx_mcast = tokio_tx.clone();
+
+    thread::spawn(move || {
         let runtime = Builder::new_current_thread()
             .thread_name("mpad-multicast")
             .enable_all()
             .build()
             .expect("Could not build tokio runtime!");
 
-        let site_id = rand::thread_rng().gen();
-
-        if let Err(err) = runtime.block_on(async_inner(site_id, tx, tokio_rx)) {
+        if let Err(err) = runtime.block_on(async_inner(site_id, tx, tokio_rx, tokio_tx_mcast)) {
             error!("Error with async task:{err:?}");
         }
     });
@@ -57,15 +67,21 @@ pub fn setup(tx: GlibSender<String>) -> TokioSender<TextChange> {
     tokio_tx
 }
 
-#[instrument(skip(tx, rx))]
+#[instrument(skip(tx, rx, tokio_tx))]
 pub async fn async_inner(
     site_id: u32,
     tx: GlibSender<String>,
     rx: TokioReceiver<TextChange>,
+    tokio_tx: TokioSender<TextChange>,
 ) -> Result<()> {
-    let site = Arc::new(RwLock::new(AutoCommit::new()));
+    let mut autocommit = AutoCommit::new();
+    let text_id = autocommit.put_object(ROOT, "text", ObjType::Text)?;
+    // fill it in
+    autocommit.splice_text(&text_id, 0, 0, "")?;
 
-    let read = read_from_multicast(site_id, site.clone(), tx);
+    let site = Arc::new(RwLock::new(autocommit));
+
+    let read = read_from_multicast(site_id, site.clone(), tx, tokio_tx);
     let write = write_to_multicast(site_id, site, rx);
 
     tokio::select! {
@@ -83,11 +99,20 @@ pub async fn async_inner(
 type Site = Arc<RwLock<AutoCommit>>;
 
 // Reads packets from the multicast group and updates local state if necessary
-#[instrument(skip(site_id, site, tx))]
-pub async fn read_from_multicast(site_id: u32, site: Site, tx: GlibSender<String>) -> Result<()> {
+
+pub async fn read_from_multicast(
+    our_id: u32,
+    site: Site,
+    tx: GlibSender<String>,
+    tokio_tx: TokioSender<TextChange>,
+) -> Result<()> {
     let mut buf = [0u8; BUF_SIZE + 16];
 
+    // A map of site partials
     let mut map = BTreeMap::new();
+
+    // a set of sites we have received their full state from
+    let mut state_set = BTreeSet::new();
 
     let recv_socket = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
     recv_socket.set_reuse_address(true)?;
@@ -109,7 +134,7 @@ pub async fn read_from_multicast(site_id: u32, site: Site, tx: GlibSender<String
 
         let incoming_site_id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
 
-        if incoming_site_id == site_id {
+        if incoming_site_id == our_id {
             trace!("Our packet, skipping!");
             continue;
         }
@@ -120,19 +145,62 @@ pub async fn read_from_multicast(site_id: u32, site: Site, tx: GlibSender<String
 
         if partials.can_reconstruct() {
             let total_buffer = partials.get_buffer();
-
             debug!("Reconstructed message len:{}", total_buffer.len());
 
-            let mut other = AutoCommit::load(&total_buffer)?;
+            let mcast_message: McastMessage = bincode::deserialize(&total_buffer)?;
 
-            let mut wrt = site.write().await;
-            wrt.merge(&mut other).unwrap();
+            match mcast_message {
+                McastMessage::DeltaChange(val) => {
+                    debug!("Site:{} DeltaChange:{}", incoming_site_id, val.len());
+                    // If we've seen this site before
+                    if state_set.contains(&incoming_site_id) {
+                        let mut wrt = site.write().await;
+                        wrt.load_incremental(&val)?;
 
-            let text_id = wrt.get(ROOT, "text")?.unwrap().1;
+                        let text_id = wrt
+                            .get(ROOT, "text")?
+                            .ok_or_else(|| eyre!("Text Object not initialised!"))?
+                            .1;
 
-            let new_value = wrt.text(&text_id).unwrap();
+                        let new_value = wrt.text(&text_id).unwrap();
 
-            tx.send(new_value)?;
+                        tx.send(new_value)?;
+                    } else {
+                        // request the full state
+                        tokio_tx
+                            .send(TextChange::RequestState {
+                                site_id: incoming_site_id,
+                            })
+                            .await?;
+                    }
+                }
+                McastMessage::State(val) => {
+                    debug!("Site:{} State:{}", incoming_site_id, val.len());
+                    let mut other = AutoCommit::load(&val)?;
+
+                    let mut wrt = site.write().await;
+
+                    wrt.merge(&mut other)?;
+
+                    let text_id = wrt
+                        .get(ROOT, "text")?
+                        .ok_or_else(|| eyre!("Text Object not initialised!"))?
+                        .1;
+
+                    debug!("State: {:#?}", wrt);
+                    let new_value = wrt.text(&text_id)?;
+
+                    tx.send(new_value)?;
+
+                    state_set.insert(incoming_site_id);
+                }
+                McastMessage::RequestState(site_id) => {
+                    debug!("Site:{} RequestState:{}", incoming_site_id, site_id);
+                    if site_id == our_id {
+                        tokio_tx.send(TextChange::SendState).await?;
+                    }
+                }
+            }
         } else {
             map.insert(incoming_site_id, partials);
         }
@@ -155,27 +223,28 @@ pub async fn write_to_multicast(
     let socket = UdpSocket::from_std(send_socket.into())?;
 
     while let Some(change) = recv.recv().await {
-        let maybe_id = { site.read().await.get(ROOT, "text")?.map(|val| val.1) };
-
-        let send_text_id = match maybe_id {
-            Some(val) => val,
-            None => site.write().await.put_object(ROOT, "text", ObjType::Text)?,
-        };
-
         let mut slock = site.write().await;
+        let send_text_id = slock
+            .get(ROOT, "text")?
+            .ok_or_else(|| eyre!("Text Object not initialised!"))?
+            .1;
 
-        match change {
+        let to_send = match change {
             TextChange::Insert { offset, text } => {
                 slock.splice_text(&send_text_id, offset, 0, &text)?;
+                McastMessage::DeltaChange(slock.save_incremental())
             }
             TextChange::Remove { offset, len } => {
                 slock.splice_text(&send_text_id, offset, len, "")?;
+                McastMessage::DeltaChange(slock.save_incremental())
             }
+            TextChange::SendState => McastMessage::State(slock.save()),
+            TextChange::RequestState { site_id } => McastMessage::RequestState(site_id),
         };
 
-        let state = slock.save();
+        let encoded: Vec<u8> = bincode::serialize(&to_send)?;
 
-        send_state(site_id, seq, &socket, &send_addr, state).await?;
+        send_state(site_id, seq, &socket, &send_addr, encoded).await?;
 
         seq = seq.wrapping_add(1);
     }
@@ -272,9 +341,7 @@ impl SitePartials {
     }
 
     fn get_buffer(&mut self) -> Vec<u8> {
-        let mut partials = Vec::new();
-
-        std::mem::swap(&mut partials, &mut self.partials);
+        let mut partials = std::mem::take(&mut self.partials);
 
         partials.sort_by(|(left, _), (right, _)| left.cmp(right));
 
@@ -293,5 +360,33 @@ impl Default for SitePartials {
             num: 0,
             partials: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_automerge() {
+        let mut site_1 = AutoCommit::new();
+        let site_1_text_id = site_1.put_object(ROOT, "text", ObjType::Text).unwrap();
+        site_1.splice_text(&site_1_text_id, 0, 0, "").unwrap();
+
+        let mut site_2 = AutoCommit::new();
+        let site2_text_id = site_2.put_object(ROOT, "text", ObjType::Text).unwrap();
+        site_2
+            .splice_text(&site2_text_id, 0, 0, "testing automerge")
+            .unwrap();
+
+        let state = site_2.save();
+
+        let mut site_2_load = AutoCommit::load(&state).unwrap();
+
+        site_1.merge(&mut site_2_load).unwrap();
+
+        let text_id = site_1.get(ROOT, "text").unwrap().unwrap().1;
+
+        assert_eq!(site_1.text(text_id).unwrap(), "testing automerge")
     }
 }

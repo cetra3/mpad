@@ -4,6 +4,7 @@ use eyre::Result;
 use gio::prelude::*;
 use gtk::prelude::*;
 use multicast::setup;
+use rand::Rng;
 use tracing::*;
 use tracing_subscriber::EnvFilter;
 
@@ -15,6 +16,8 @@ use crate::multicast::TextChange;
 mod multicast;
 
 fn build_ui(application: &gtk::Application) {
+    let site_id = rand::thread_rng().gen();
+
     let text_view = gtk::TextView::builder()
         .monospace(true)
         .margin_bottom(5)
@@ -27,7 +30,7 @@ fn build_ui(application: &gtk::Application) {
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .title("Mpad")
+        .title(&format!("Mpad - {site_id}"))
         .default_width(800)
         .default_height(600)
         .child(&scroll)
@@ -42,12 +45,17 @@ fn build_ui(application: &gtk::Application) {
 
     let (tx, rx) = glib::MainContext::channel(glib::PRIORITY_DEFAULT);
 
-    let send = setup(tx);
+    let send = setup(tx, site_id);
 
     let send_remove = send.clone();
+    let span = span!(Level::INFO, "ui", site_id);
+
+    let insert_span = span.clone();
+    let delete_span = span.clone();
 
     text_buffer.connect_insert_text(move |_val, left, text| {
         if !insert_in_change.load(Ordering::Relaxed) {
+            let _enter = insert_span.enter();
             debug!("Text inserted offset:{}, len:{}", left.offset(), text.len());
 
             send.try_send(TextChange::Insert {
@@ -60,6 +68,7 @@ fn build_ui(application: &gtk::Application) {
 
     text_buffer.connect_delete_range(move |_val, left, right| {
         if !delete_in_change.load(Ordering::Relaxed) {
+            let _enter = delete_span.enter();
             debug!("Range deleted:{}-{}", left.offset(), right.offset());
 
             send_remove
@@ -72,6 +81,8 @@ fn build_ui(application: &gtk::Application) {
     });
 
     rx.attach(None, move |text| {
+        let _enter = span.enter();
+        debug!("Received update: {text}");
         in_change.store(true, Ordering::Relaxed);
 
         text_buffer.set_text(&text);
