@@ -187,7 +187,6 @@ pub async fn read_from_multicast(
                         .ok_or_else(|| eyre!("Text Object not initialised!"))?
                         .1;
 
-                    debug!("State: {:#?}", wrt);
                     let new_value = wrt.text(&text_id)?;
 
                     tx.send(new_value)?;
@@ -219,8 +218,15 @@ pub async fn write_to_multicast(
     send_socket.set_nonblocking(true)?;
 
     let send_addr = "239.1.1.1:1111".parse::<SocketAddr>()?.into();
-
     let socket = UdpSocket::from_std(send_socket.into())?;
+
+    // Send the state initially
+    {
+        let mut slock = site.write().await;
+        let encoded: Vec<u8> = bincode::serialize(&McastMessage::State(slock.save()))?;
+
+        send_state(site_id, seq, &socket, &send_addr, encoded).await?;
+    }
 
     while let Some(change) = recv.recv().await {
         let mut slock = site.write().await;

@@ -82,7 +82,7 @@ fn build_ui(application: &gtk::Application) {
 
     rx.attach(None, move |text| {
         let _enter = span.enter();
-        debug!("Received update: {text}");
+        debug!("Received update: {}", text.len());
         in_change.store(true, Ordering::Relaxed);
 
         text_buffer.set_text(&text);
