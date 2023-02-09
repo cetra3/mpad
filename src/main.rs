@@ -39,7 +39,7 @@ fn build_ui(application: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(application)
-        .title(&format!("Mpad - {site_id}"))
+        .title(&format!("Mpad"))
         .default_width(800)
         .default_height(600)
         .content(&content)

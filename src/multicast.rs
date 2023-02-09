@@ -1,7 +1,7 @@
 use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjType, ReadDoc, ROOT};
 
-use eyre::eyre;
+use eyre::{eyre, Context};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Socket, Type};
 use tokio::net::UdpSocket;
@@ -10,6 +10,8 @@ use tokio::runtime::Builder;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use std::convert::TryInto;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use eyre::Result;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +32,7 @@ use std::cmp;
 
 use std::sync::Arc;
 
+const STORAGE_LOCATION: &str = "~/.local/share/mpad/automerge.save";
 const BUF_SIZE: usize = 1400;
 
 #[derive(Debug)]
@@ -68,6 +71,8 @@ pub fn setup(tx: GlibSender<String>, site_id: u32) -> TokioSender<TextChange> {
     tokio_tx
 }
 
+type Site = Arc<RwLock<AutoCommit>>;
+
 #[instrument(skip(tx, rx, tokio_tx))]
 pub async fn async_inner(
     site_id: u32,
@@ -75,15 +80,47 @@ pub async fn async_inner(
     rx: TokioReceiver<TextChange>,
     tokio_tx: TokioSender<TextChange>,
 ) -> Result<()> {
-    let mut autocommit = AutoCommit::new();
-    let text_id = autocommit.put_object(ROOT, "text", ObjType::Text)?;
-    // fill it in
-    autocommit.splice_text(&text_id, 0, 0, "")?;
+    let file_location = shellexpand::tilde(
+        &std::env::var("MPAD_AUTOSAVE_PATH").unwrap_or_else(|_| STORAGE_LOCATION.to_owned()),
+    )
+    .to_string();
 
-    let site = Arc::new(RwLock::new(autocommit));
+    let ac = if let Ok(file) = tokio::fs::read(&file_location).await {
+        debug!("Loaded automerge save from path {file_location}");
+        let autocommit = AutoCommit::load(&file)?;
 
-    let read = read_from_multicast(site_id, site.clone(), tx, tokio_tx);
-    let write = write_to_multicast(site_id, site, rx);
+        let text_id = autocommit
+            .get(ROOT, "text")?
+            .ok_or_else(|| eyre!("Text Object not initialised!"))?
+            .1;
+
+        let new_value = autocommit.text(&text_id)?;
+
+        tx.send(new_value)?;
+        autocommit
+    } else {
+        let mut autocommit = AutoCommit::new();
+        let text_id = autocommit.put_object(ROOT, "text", ObjType::Text)?;
+        // fill it in
+        autocommit.splice_text(&text_id, 0, 0, "")?;
+        autocommit
+    };
+
+    // This is the file writing task
+    let (write_tx, write_rx) = tokio_channel::<()>(1);
+
+    let site = Arc::new(RwLock::new(ac));
+
+    let state_site = site.clone();
+
+    tokio::spawn(async move {
+        if let Err(err) = save_state_task(file_location, state_site, write_rx).await {
+            error!("{err:?}");
+        }
+    });
+
+    let read = read_from_multicast(site_id, site.clone(), tx, tokio_tx, write_tx.clone());
+    let write = write_to_multicast(site_id, site, rx, write_tx);
 
     tokio::select! {
         val = read => {
@@ -97,7 +134,36 @@ pub async fn async_inner(
     Ok(())
 }
 
-type Site = Arc<RwLock<AutoCommit>>;
+async fn save_state_task(path: String, site: Site, mut rx: TokioReceiver<()>) -> Result<()> {
+    let path_buf = PathBuf::from(&path);
+
+    if let Some(parent) = path_buf.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "Could not create parent dir for writing: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    while rx.recv().await.is_some() {
+        debug!("Save State Called");
+        let state = {
+            // we don't want to stuff up the save_incremental stuff so we save a clone
+            site.read().await.clone().save()
+        };
+        debug!("Grabbed State");
+
+        tokio::fs::write(&path, state)
+            .await
+            .with_context(|| format!("Could not save to {path}"))?;
+
+        //// Throttle so we're not saving *all* the time
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    Ok(())
+}
 
 // Reads packets from the multicast group and updates local state if necessary
 
@@ -106,6 +172,7 @@ pub async fn read_from_multicast(
     site: Site,
     tx: GlibSender<String>,
     tokio_tx: TokioSender<TextChange>,
+    write_tx: TokioSender<()>,
 ) -> Result<()> {
     let mut buf = [0u8; BUF_SIZE + 16];
 
@@ -150,6 +217,8 @@ pub async fn read_from_multicast(
 
             let mcast_message: McastMessage = bincode::deserialize(&total_buffer)?;
 
+            let mut should_notify_save = false;
+
             match mcast_message {
                 McastMessage::DeltaChange(val) => {
                     debug!("Site:{} DeltaChange:{}", incoming_site_id, val.len());
@@ -165,6 +234,7 @@ pub async fn read_from_multicast(
 
                         let new_value = wrt.text(&text_id).unwrap();
 
+                        should_notify_save = true;
                         tx.send(new_value)?;
                     } else {
                         // request the full state
@@ -207,6 +277,7 @@ pub async fn read_from_multicast(
                     tx.send(new_value)?;
 
                     state_set.insert(incoming_site_id);
+                    should_notify_save = true;
                 }
                 McastMessage::RequestState(site_id) => {
                     debug!("Site:{} RequestState:{}", incoming_site_id, site_id);
@@ -219,6 +290,10 @@ pub async fn read_from_multicast(
                     tokio_tx.send(TextChange::SendState).await?;
                 }
             }
+
+            if should_notify_save {
+                write_tx.try_send(()).ok();
+            }
         } else {
             map.insert(incoming_site_id, partials);
         }
@@ -230,6 +305,7 @@ pub async fn write_to_multicast(
     site_id: u32,
     site: Site,
     mut recv: TokioReceiver<TextChange>,
+    write_tx: TokioSender<()>,
 ) -> Result<()> {
     let mut seq: u32 = 1;
 
@@ -253,13 +329,17 @@ pub async fn write_to_multicast(
             .ok_or_else(|| eyre!("Text Object not initialised!"))?
             .1;
 
+        let mut should_notify_save = false;
+
         let to_send = match change {
             TextChange::Insert { offset, text } => {
                 slock.splice_text(&send_text_id, offset, 0, &text)?;
+                should_notify_save = true;
                 McastMessage::DeltaChange(slock.save_incremental())
             }
             TextChange::Remove { offset, len } => {
                 slock.splice_text(&send_text_id, offset, len, "")?;
+                should_notify_save = true;
                 McastMessage::DeltaChange(slock.save_incremental())
             }
             TextChange::SendState => McastMessage::State(slock.save()),
@@ -271,6 +351,10 @@ pub async fn write_to_multicast(
         send_state(site_id, seq, &socket, &send_addr, encoded).await?;
 
         seq = seq.wrapping_add(1);
+
+        if should_notify_save {
+            write_tx.try_send(()).ok();
+        }
     }
 
     Ok(())
