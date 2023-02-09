@@ -45,6 +45,7 @@ pub enum McastMessage {
     DeltaChange(Vec<u8>),
     State(Vec<u8>),
     RequestState(u32),
+    Announce,
 }
 
 pub fn setup(tx: GlibSender<String>, site_id: u32) -> TokioSender<TextChange> {
@@ -180,7 +181,21 @@ pub async fn read_from_multicast(
 
                     let mut wrt = site.write().await;
 
-                    wrt.merge(&mut other)?;
+                    let text_id = wrt
+                        .get(ROOT, "text")?
+                        .ok_or_else(|| eyre!("Text Object not initialised!"))?
+                        .1;
+
+                    let current_value = wrt.text(&text_id)?;
+
+                    // If this is a newly initialised instance
+                    if current_value == "" {
+                        let new = other.with_actor(wrt.get_actor().clone());
+
+                        *wrt = new;
+                    } else {
+                        wrt.merge(&mut other)?;
+                    }
 
                     let text_id = wrt
                         .get(ROOT, "text")?
@@ -198,6 +213,10 @@ pub async fn read_from_multicast(
                     if site_id == our_id {
                         tokio_tx.send(TextChange::SendState).await?;
                     }
+                }
+                McastMessage::Announce => {
+                    debug!("Announce from Site:{}, sending our state", incoming_site_id);
+                    tokio_tx.send(TextChange::SendState).await?;
                 }
             }
         } else {
@@ -220,10 +239,9 @@ pub async fn write_to_multicast(
     let send_addr = "239.1.1.1:1111".parse::<SocketAddr>()?.into();
     let socket = UdpSocket::from_std(send_socket.into())?;
 
-    // Send the state initially
+    // Send an announce initially
     {
-        let mut slock = site.write().await;
-        let encoded: Vec<u8> = bincode::serialize(&McastMessage::State(slock.save()))?;
+        let encoded: Vec<u8> = bincode::serialize(&McastMessage::Announce)?;
 
         send_state(site_id, seq, &socket, &send_addr, encoded).await?;
     }

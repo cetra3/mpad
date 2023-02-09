@@ -1,8 +1,8 @@
 use gtk4 as gtk;
 
+use adw::{prelude::*, HeaderBar};
 use eyre::Result;
-use gio::prelude::*;
-use gtk::prelude::*;
+use gtk::{Box, Orientation};
 use multicast::setup;
 use rand::Rng;
 use tracing::*;
@@ -15,25 +15,34 @@ use crate::multicast::TextChange;
 
 mod multicast;
 
-fn build_ui(application: &gtk::Application) {
+fn build_ui(application: &adw::Application) {
     let site_id = rand::thread_rng().gen();
 
     let text_view = gtk::TextView::builder()
         .monospace(true)
-        .margin_bottom(5)
-        .margin_end(5)
-        .margin_start(5)
-        .margin_top(5)
+        .left_margin(5)
+        .top_margin(5)
+        .bottom_margin(5)
+        .right_margin(5)
         .build();
 
-    let scroll = gtk::ScrolledWindow::builder().child(&text_view).build();
+    let scroll = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .child(&text_view)
+        .build();
 
-    let window = gtk::ApplicationWindow::builder()
+    let content = Box::new(Orientation::Vertical, 0);
+
+    content.append(&HeaderBar::new());
+    content.append(&scroll);
+
+    let window = adw::ApplicationWindow::builder()
         .application(application)
         .title(&format!("Mpad - {site_id}"))
         .default_width(800)
         .default_height(600)
-        .child(&scroll)
+        .content(&content)
         .build();
 
     // Attach receiver to the main context and set the text buffer text from here
@@ -107,7 +116,7 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let application = gtk::Application::new(Some("io.github.cetra3.mpad"), Default::default());
+    let application = adw::Application::new(Some("io.github.cetra3.mpad"), Default::default());
 
     application.connect_activate(|app| {
         build_ui(app);
