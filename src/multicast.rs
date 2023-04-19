@@ -22,6 +22,8 @@ use tokio::sync::mpsc::{
     channel as tokio_channel, Receiver as TokioReceiver, Sender as TokioSender,
 };
 
+use tokio::sync::oneshot::{channel as oneshot_channel, Sender as OneshotSender};
+
 use tokio::sync::RwLock;
 
 use glib::Sender as GlibSender;
@@ -40,6 +42,7 @@ pub enum TextChange {
     Insert { offset: usize, text: String },
     Remove { offset: usize, len: usize },
     SendState,
+    Shutdown { sender: OneshotSender<()> },
     RequestState { site_id: u32 },
 }
 
@@ -107,7 +110,7 @@ pub async fn async_inner(
     };
 
     // This is the file writing task
-    let (write_tx, write_rx) = tokio_channel::<()>(1);
+    let (write_tx, write_rx) = tokio_channel::<OneshotSender<()>>(1);
 
     let site = Arc::new(RwLock::new(ac));
 
@@ -134,7 +137,11 @@ pub async fn async_inner(
     Ok(())
 }
 
-async fn save_state_task(path: String, site: Site, mut rx: TokioReceiver<()>) -> Result<()> {
+async fn save_state_task(
+    path: String,
+    site: Site,
+    mut rx: TokioReceiver<OneshotSender<()>>,
+) -> Result<()> {
     let path_buf = PathBuf::from(&path);
 
     if let Some(parent) = path_buf.parent() {
@@ -146,7 +153,7 @@ async fn save_state_task(path: String, site: Site, mut rx: TokioReceiver<()>) ->
         })?;
     }
 
-    while rx.recv().await.is_some() {
+    while let Some(sender) = rx.recv().await {
         debug!("Save State Called");
         let state = {
             // we don't want to stuff up the save_incremental stuff so we save a clone
@@ -157,6 +164,10 @@ async fn save_state_task(path: String, site: Site, mut rx: TokioReceiver<()>) ->
         tokio::fs::write(&path, state)
             .await
             .with_context(|| format!("Could not save to {path}"))?;
+
+        debug!("Wrote State, notifying");
+        // Notify the receiver that we have saved
+        sender.send(()).ok();
 
         //// Throttle so we're not saving *all* the time
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -172,7 +183,7 @@ pub async fn read_from_multicast(
     site: Site,
     tx: GlibSender<String>,
     tokio_tx: TokioSender<TextChange>,
-    write_tx: TokioSender<()>,
+    write_tx: TokioSender<OneshotSender<()>>,
 ) -> Result<()> {
     let mut buf = [0u8; BUF_SIZE + 16];
 
@@ -292,7 +303,7 @@ pub async fn read_from_multicast(
             }
 
             if should_notify_save {
-                write_tx.try_send(()).ok();
+                write_tx.try_send(oneshot_channel().0).ok();
             }
         } else {
             map.insert(incoming_site_id, partials);
@@ -305,7 +316,7 @@ pub async fn write_to_multicast(
     site_id: u32,
     site: Site,
     mut recv: TokioReceiver<TextChange>,
-    write_tx: TokioSender<()>,
+    write_tx: TokioSender<OneshotSender<()>>,
 ) -> Result<()> {
     let mut seq: u32 = 1;
 
@@ -344,6 +355,10 @@ pub async fn write_to_multicast(
             }
             TextChange::SendState => McastMessage::State(slock.save()),
             TextChange::RequestState { site_id } => McastMessage::RequestState(site_id),
+            TextChange::Shutdown { sender } => {
+                write_tx.send(sender).await.ok();
+                continue;
+            }
         };
 
         let encoded: Vec<u8> = bincode::serialize(&to_send)?;
@@ -353,7 +368,7 @@ pub async fn write_to_multicast(
         seq = seq.wrapping_add(1);
 
         if should_notify_save {
-            write_tx.try_send(()).ok();
+            write_tx.try_send(oneshot_channel().0).ok();
         }
     }
 

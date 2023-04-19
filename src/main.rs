@@ -57,6 +57,7 @@ fn build_ui(application: &adw::Application) {
     let send = setup(tx, site_id);
 
     let send_remove = send.clone();
+    let send_shutdown = send.clone();
     let span = span!(Level::INFO, "ui", site_id);
 
     let insert_span = span.clone();
@@ -99,6 +100,21 @@ fn build_ui(application: &adw::Application) {
         in_change.store(false, Ordering::Relaxed);
 
         glib::Continue(true)
+    });
+
+    // Make sure our state is appropriately written on shutdown
+    window.connect_destroy(move |_val| {
+        debug!("Window destroyed!");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        send_shutdown
+            .try_send(TextChange::Shutdown { sender })
+            .expect("Could not notify the writer to shutdown");
+
+        receiver
+            .blocking_recv()
+            .expect("Could not wait for the receiver");
+        debug!("Closing off");
     });
 
     window.show();
